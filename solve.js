@@ -1,293 +1,417 @@
-// Fast drop-in for makefun-diff 1.0.0: the same patch of two texts, computed
-// with integer line ids and a flat Myers history instead of string compares
-// and per-line objects. Written from the RULES.txt specification.
+// diff-speed-01 v2: a faster drop-in for makefun-diff 1.0.0.
 //
-// A text is cut after every "\n"; a last line without "\n" is a line too.
-// Lines are equal only as identical code units, newline included. The edit
-// script keeps the common prefix, then the common suffix, and between them
-// runs Myers's greedy search: on each diagonal the furthest point wins, a
-// deletion wins a tie with an insertion, no move passes either text's end,
-// and every run of equal lines is followed as far as it goes. The patch
-// lists, per change run, its deletions before its insertions, shows up to
-// 3 kept lines around each run, and merges runs at most 6 kept lines apart.
+// The task (RULES.txt): for each case's { old, new }, return exactly the
+// patch makefun-diff 1.0.0 returns. Lines are cut after every '\n'; a last
+// line with no '\n' is a line too; two lines are equal only when they are
+// the same code units, newline or its absence included. The edit script is
+// Myers's greedy search (common prefix, then common suffix, then the greedy
+// search from the first lines; on each diagonal the path reaching furthest
+// into the old text; a deletion wins when it ties an insertion; never past
+// either text's end; no edge diagonal pruned; every run of equal lines
+// followed as far as it goes; the first path to reach both ends wins).
+// The patch: a header line, then hunks with 3 lines of context, runs
+// merged at most 6 kept lines apart, deletions before insertions in a run,
+// '%' after a bare last line; identical texts are the header alone.
+//
+// Speed angle (the algorithm is fixed by the spec, so the win is in the
+// constants of the search loop, which is ~80% of the runtime):
+// - The search loop works on integer line ids, not strings.
+// - The V history is one row-major Int32Array: row d starts at d*(d+1)/2,
+//   so the two candidates for diagonal k at level d are the previous
+//   row's entries j-1 and j, a plain counted loop with no index arithmetic
+//   per step. The history doubles as the backtrack record: no second pass.
+// - The interior of each row is unrolled two diagonals at a time, so the
+//   middle V value is loaded once for both.
+// - Both id arrays carry a sentinel past their end (-1 for old, -2 for
+//   new, two values that can never be a real line id), so the snake loop
+//   needs no bounds checks at all.
+// - Line ids come from one shared Map keyed by the line's text without its
+//   newline (only a bare last line needs a distinguishing suffix), built
+//   from the native split('\n') instead of a hand-rolled scan.
 
-/** Split a text into lines, each keeping its trailing "\n" when it has one. */
-function splitLines(text) {
-  const lines = [];
-  let start = 0;
-  for (;;) {
-    const nl = text.indexOf('\n', start);
-    if (nl < 0) {
-      if (start < text.length) lines.push(text.slice(start));
-      break;
-    }
-    lines.push(text.slice(start, nl + 1));
-    start = nl + 1;
-  }
-  return lines;
+const H_MAX_D = 12000;
+
+// The V history, reused across cases and grown by doubling rows. Row d
+// holds d+1 entries (diagonals k = -d, -d+2, ..., d) at offset d*(d+1)/2.
+let hist = new Int32Array(0);
+let histCapD = 0;
+
+function ensureHist(d) {
+  if (d <= histCapD) return;
+  let nd = histCapD === 0 ? 1024 : histCapD * 2;
+  while (nd < d) nd *= 2;
+  if (nd > H_MAX_D) throw new Error('diff-speed-01: edit distance exceeds supported bound');
+  const next = new Int32Array(((nd + 1) * (nd + 2)) / 2);
+  next.set(hist.subarray(0, ((histCapD + 1) * (histCapD + 2)) / 2));
+  hist = next;
+  histCapD = nd;
 }
 
-/**
- * Map every distinct line string to a small integer id, shared by both
- * texts, so the search compares integers instead of strings.
- */
-function toIds(lines, ids, next) {
-  const out = new Int32Array(lines.length);
-  for (let i = 0; i < lines.length; i++) {
-    const s = lines[i];
-    let id = ids.get(s);
+// Split a text into lines and map every line to an integer id shared with
+// the other text. Returns the parts (without newlines), the id array (one
+// past-the-end sentinel slot included), the line count, and whether the
+// text ends with a bare last line.
+function lineIds(text, map, nextId, sentinel) {
+  const parts = text.split('\n');
+  const n = text === '' ? 0 : (text.endsWith('\n') ? parts.length - 1 : parts.length);
+  const bare = n > 0 && !text.endsWith('\n');
+  const ids = new Int32Array(n + 1);
+  for (let i = 0; i < n; i++) {
+    const key = (bare && i === n - 1) ? parts[i] + '\n' : parts[i];
+    let id = map.get(key);
     if (id === undefined) {
-      id = next.value;
-      next.value = id + 1;
-      ids.set(s, id);
+      id = nextId.value++;
+      map.set(key, id);
     }
-    out[i] = id;
+    ids[i] = id;
   }
-  return out;
+  ids[n] = sentinel;
+  return { parts, ids, n, bare };
 }
 
-/**
- * Myers's greedy search over the middle slices a[p..p+N), b[p..p+M).
- * Returns the edit distance D and the flat history of furthest-x values:
- * history[d*d + k + d] is the furthest old-line index reached on diagonal
- * k after d edits (and the snake that follows), or -1 when no path of d
- * edits reaches that diagonal at all.
- */
-function myers(a, p, N, b, q, M) {
-  let cap = 64;
-  let hist = new Int32Array((cap + 1) * (cap + 1));
-  let D = -1;
-  outer: for (let d = 0; d <= N + M; d++) {
-    if (d > cap) {
-      const nextCap = cap * 2;
-      const grown = new Int32Array((nextCap + 1) * (nextCap + 1));
-      grown.set(hist);
-      hist = grown;
-      cap = nextCap;
-    }
-    const base = d * d;
-    const prev = (d - 1) * (d - 1);
-    // Row starts, so the inner loop indexes with one addition each:
-    // hist[row + k] is this depth's V, hist[prow + kk] the previous depth's.
-    const row = base + d;
-    const prow = prev + d - 1;
-    for (let k = -d; k <= d; k += 2) {
-      let x;
-      if (d === 0) {
-        x = 0;
-      } else {
-        let delX = -1;
-        let insX = -1;
-        if (k > -d) {
-          const pv = hist[prow + k - 1];
-          if (pv >= 0 && pv + 1 <= N) delX = pv + 1;
-        }
-        if (k < d) {
-          const pv = hist[prow + k + 1];
-          if (pv >= 0 && pv - (k + 1) + 1 <= M) insX = pv;
-        }
-        if (delX < 0 && insX < 0) {
-          hist[row + k] = -1;
-          continue;
-        }
-        // Deletion wins the tie: it reaches further into the old text.
-        x = delX >= insX ? delX : insX;
-      }
-      let y = x - k;
-      while (x < N && y < M && a[p + x] === b[q + y]) {
-        x++;
-        y++;
-      }
-      hist[row + k] = x;
-      if (x >= N && y >= M) {
-        D = d;
-        break outer;
-      }
-    }
+// The greedy search on the middle (after prefix/suffix strip). a and b are
+// the middle id arrays with their sentinels already placed just past the
+// middle; N and M are the middle lengths. Returns D, the edit distance,
+// and leaves every V row in `hist` for the backtrack.
+function myers(a, b, N, M) {
+  const max = N + M;
+  // Level 0: the snake from (0, 0). The sentinel pair (-1 vs -2) stops it
+  // exactly at the end of either text.
+  let x = 0;
+  let y = 0;
+  while (a[x] === b[y]) {
+    x++;
+    y++;
   }
-  return { D, hist };
+  ensureHist(1);
+  hist[0] = x;
+  if (x === N && y === M) return 0;
+  let oPrev = 0;
+  let oCur = 1;
+  for (let d = 1; d <= max; d++) {
+    ensureHist(d);
+    // j = 0, k = -d: insertion only.
+    let xx = hist[oPrev];
+    if (xx > N) xx = N;
+    let yy = xx + d;
+    if (yy > M) {
+      yy = M;
+      xx = yy - d;
+    }
+    while (a[xx] === b[yy]) {
+      xx++;
+      yy++;
+    }
+    hist[oCur] = xx;
+    if (xx === N && yy === M) return d;
+    // Interior diagonals, two at a time. For j, the candidates are the
+    // previous row's j-1 (deletion, x = v+1) and j (insertion, x = v); a
+    // deletion wins the tie, so the insertion is taken only when its
+    // reach is strictly greater than the deletion's.
+    let j = 1;
+    for (; j + 1 <= d - 1; j += 2) {
+      const v0 = hist[oPrev + j - 1];
+      const v1 = hist[oPrev + j];
+      const v2 = hist[oPrev + j + 1];
+      const k1 = 2 * j - d;
+      let x1 = (v0 + 1 < v1) ? v1 : v0 + 1;
+      if (x1 > N) x1 = N;
+      let y1 = x1 - k1;
+      if (y1 > M) {
+        y1 = M;
+        x1 = y1 + k1;
+      }
+      while (a[x1] === b[y1]) {
+        x1++;
+        y1++;
+      }
+      hist[oCur + j] = x1;
+      if (x1 === N && y1 === M) return d;
+      let x2 = (v1 + 1 < v2) ? v2 : v1 + 1;
+      if (x2 > N) x2 = N;
+      let y2 = x2 - k1 - 2;
+      if (y2 > M) {
+        y2 = M;
+        x2 = y2 + k1 + 2;
+      }
+      while (a[x2] === b[y2]) {
+        x2++;
+        y2++;
+      }
+      hist[oCur + j + 1] = x2;
+      if (x2 === N && y2 === M) return d;
+    }
+    // One leftover interior diagonal when d is even.
+    for (; j <= d - 1; j++) {
+      const k = 2 * j - d;
+      let xt = (hist[oPrev + j - 1] + 1 < hist[oPrev + j]) ? hist[oPrev + j] : hist[oPrev + j - 1] + 1;
+      if (xt > N) xt = N;
+      let yt = xt - k;
+      if (yt > M) {
+        yt = M;
+        xt = yt + k;
+      }
+      while (a[xt] === b[yt]) {
+        xt++;
+        yt++;
+      }
+      hist[oCur + j] = xt;
+      if (xt === N && yt === M) return d;
+    }
+    // j = d, k = d: deletion only.
+    let xd = hist[oPrev + d - 1] + 1;
+    if (xd > N) xd = N;
+    let yd = xd - d;
+    if (yd > M) {
+      yd = M;
+      xd = yd + d;
+    }
+    while (a[xd] === b[yd]) {
+      xd++;
+      yd++;
+    }
+    hist[oCur + d] = xd;
+    if (xd === N && yd === M) return d;
+    oPrev = oCur;
+    oCur += d + 1;
+  }
+  return -1;
 }
 
-/**
- * Walk the history back from (N, M) and rebuild the middle edit script:
- * 0 keep, 1 delete, 2 insert. The array is filled from the end, so the
- * caller reads ops[oi .. N+M).
- */
-function backtrack(hist, D, a, p, N, b, q, M) {
-  const ops = new Uint8Array(N + M);
-  let oi = N + M;
+// Op types for the backtracked script.
+const KEEP = 0;
+const DEL = 1;
+const INS = 2;
+// A merged DEL/INS run in the render (never produced by the backtrack).
+const CHANGE = 3;
+
+// Walk the search back from (N, M) and return the middle's op segments,
+// forward order, as [type, count] pairs with adjacent equal types merged.
+// The V rows in `hist` say, for each level, which diagonal the path came
+// from; the snake between the edit step and the row's end is all keeps,
+// counted arithmetically, never re-compared.
+function backtrack(N, M, D) {
+  const segs = [];
+  const push = (type, count) => {
+    if (count <= 0) return;
+    const last = segs[segs.length - 1];
+    if (last !== undefined && last[0] === type) last[1] += count;
+    else segs.push([type, count]);
+  };
   let x = N;
   let y = M;
-  for (let d = D; d > 0; d--) {
-    const k = x - y;
-    const prev = (d - 1) * (d - 1);
-    const prow = prev + d - 1;
-    let delX = -1;
-    let insX = -1;
-    if (k > -d) {
-      const pv = hist[prow + k - 1];
-      if (pv >= 0 && pv + 1 <= N) delX = pv + 1;
+  let k = N - M;
+  for (let d = D; d >= 1; d--) {
+    const oPrev = ((d - 1) * d) / 2;
+    const j = (k + d) / 2;
+    let kPrev;
+    let xPrev;
+    let isDel;
+    if (j === 0) {
+      kPrev = k + 1;
+      xPrev = hist[oPrev];
+      isDel = false;
+    } else if (j === d) {
+      kPrev = k - 1;
+      xPrev = hist[oPrev + d - 1];
+      isDel = true;
+    } else if (hist[oPrev + j - 1] + 1 < hist[oPrev + j]) {
+      kPrev = k + 1;
+      xPrev = hist[oPrev + j];
+      isDel = false;
+    } else {
+      kPrev = k - 1;
+      xPrev = hist[oPrev + j - 1];
+      isDel = true;
     }
-    if (k < d) {
-      const pv = hist[prow + k + 1];
-      if (pv >= 0 && pv - (k + 1) + 1 <= M) insX = pv;
-    }
-    const isDel = delX >= insX;
-    const prevK = isDel ? k - 1 : k + 1;
-    const px = isDel ? delX : insX;
-    // The snake from the post-edit point (px, py) to (x, y): all keeps.
-    let keep = x - px;
-    while (keep-- > 0) ops[--oi] = 0;
-    ops[--oi] = isDel ? 1 : 2;
-    x = hist[prow + prevK];
-    y = x - prevK;
+    const yPrev = xPrev - kPrev;
+    // The snake at this level ran from just past the edit step to (x, y).
+    const xs = isDel ? xPrev + 1 : xPrev;
+    push(KEEP, x - xs);
+    push(isDel ? DEL : INS, 1);
+    x = xPrev;
+    y = yPrev;
+    k = kPrev;
   }
-  while (x > 0) {
-    ops[--oi] = 0;
-    x--;
-    y--;
-  }
-  return { ops, oi };
+  // The level-0 snake from (0, 0).
+  push(KEEP, x);
+  segs.reverse();
+  return segs;
 }
 
-/** One output line: the marker, the line, and a "%" line when bare. */
-function emitLine(out, marker, line) {
-  out.push(marker + line);
-  if (!line.endsWith('\n')) {
-    out.push('\n%\n');
-  }
-}
+export function run(input) {
+  const oldText = input.old;
+  const newText = input.new;
+  const map = new Map();
+  const nextId = { value: 0 };
+  const o = lineIds(oldText, map, nextId, -1);
+  const w = lineIds(newText, map, nextId, -2);
+  const aAll = o.ids;
+  const bAll = w.ids;
+  const nOld = o.n;
+  const nNew = w.n;
 
-/**
- * Render the patch for the whole texts from the op list (0 keep, 1 delete,
- * 2 insert, aligned with the old/new line arrays).
- */
-function render(oldLines, newLines, ops, total) {
-  const nOld = oldLines.length;
-  const nNew = newLines.length;
-  // Find the change runs: [start, end) op ranges holding no keeps.
-  const runs = [];
-  let i = 0;
+  // Common prefix, then common suffix, on ids.
+  let pre = 0;
+  while (pre < nOld && pre < nNew && aAll[pre] === bAll[pre]) pre++;
+  let suf = 0;
+  while (suf < nOld - pre && suf < nNew - pre && aAll[nOld - 1 - suf] === bAll[nNew - 1 - suf]) suf++;
+  const N = nOld - pre - suf;
+  const M = nNew - pre - suf;
+  // Sentinels just past the middle: the middle's own end, so the snake
+  // can never run into the suffix. (The suffix ids are never read again.)
+  aAll[pre + N] = -1;
+  bAll[pre + M] = -2;
+  const a = aAll.subarray(pre, pre + N + 1);
+  const b = bAll.subarray(pre, pre + M + 1);
+
+  const D = myers(a, b, N, M);
+  const mid = backtrack(N, M, D);
+
+  // Full op segments: kept prefix, the middle's script, kept suffix.
+  const segs = [];
+  const pushSeg = (type, count) => {
+    if (count <= 0) return;
+    const last = segs[segs.length - 1];
+    if (last !== undefined && last[0] === type) last[1] += count;
+    else segs.push([type, count]);
+  };
+  pushSeg(KEEP, pre);
+  for (const s of mid) pushSeg(s[0], s[1]);
+  pushSeg(KEEP, suf);
+
+  // Annotate every segment with the line spans it covers, then merge each
+  // maximal DEL/INS run into one CHANGE segment. A run's deletions are
+  // rendered before its insertions (the path's own order may interleave
+  // them), so the render reads del/ins off the CHANGE, never the path order.
+  const rich = [];
+  {
+    let oi = 0;
+    let ni = 0;
+    for (const s of segs) {
+      if (s[0] === KEEP) {
+        rich.push({ t: KEEP, n: s[1], oStart: oi, nStart: ni });
+        oi += s[1];
+        ni += s[1];
+      } else if (s[0] === DEL) {
+        rich.push({ t: DEL, n: s[1], oStart: oi, nStart: ni });
+        oi += s[1];
+      } else {
+        rich.push({ t: INS, n: s[1], oStart: oi, nStart: ni });
+        ni += s[1];
+      }
+    }
+  }
+  const merged = [];
   let deleted = 0;
   let inserted = 0;
-  while (i < total) {
-    if (ops[i] === 0) {
-      i++;
+  for (const r of rich) {
+    if (r.t === KEEP) {
+      merged.push(r);
       continue;
     }
-    const start = i;
-    let d = 0;
-    let ins = 0;
-    while (i < total && ops[i] !== 0) {
-      if (ops[i] === 1) d++;
-      else ins++;
-      i++;
+    const last = merged[merged.length - 1];
+    if (last !== undefined && last.t === CHANGE) {
+      if (r.t === DEL) last.del += r.n;
+      else last.ins += r.n;
+    } else {
+      merged.push({ t: CHANGE, del: r.t === DEL ? r.n : 0, ins: r.t === INS ? r.n : 0, oStart: r.oStart, nStart: r.nStart });
     }
-    runs.push({ start, end: i, del: d, ins });
-    deleted += d;
-    inserted += ins;
+    if (r.t === DEL) deleted += r.n;
+    else inserted += r.n;
   }
 
+  // Hunk spans. A run is one CHANGE segment; two runs at most 6 kept lines
+  // apart share a hunk. oEnd/nEnd are the ends of the last CHANGE only:
+  // the kept gap between runs is inside the hunk span by position, never
+  // by extending the run's end across it.
+  const spans = [];
+  let run = null;
+  for (const r of merged) {
+    if (r.t === KEEP) {
+      if (run !== null) run.gap += r.n;
+    } else {
+      const oEnd = r.oStart + r.del;
+      const nEnd = r.nStart + r.ins;
+      if (run === null || run.gap > 6) {
+        if (run !== null) spans.push(run);
+        run = { oStart: r.oStart, nStart: r.nStart, oEnd, nEnd, gap: 0 };
+      } else {
+        run.oEnd = oEnd;
+        run.nEnd = nEnd;
+        run.gap = 0;
+      }
+    }
+  }
+  if (run !== null) spans.push(run);
+  const hSpans = spans.map((h) => ({
+    oStart: Math.max(0, h.oStart - 3),
+    nStart: Math.max(0, h.nStart - 3),
+    oEnd: Math.min(nOld, h.oEnd + 3),
+    nEnd: Math.min(nNew, h.nEnd + 3),
+  }));
+
+  // Single pass over the segments, emitting only the lines inside a hunk
+  // span. Hunk spans are disjoint and ordered, so one cursor suffices.
   const out = [];
-  if (runs.length === 0) {
-    out.push(
-      `makefun-diff/1 old=${nOld} new=${nNew} hunks=0 deleted=0 inserted=0\n`,
-    );
-    return out.join('');
-  }
-
-  // Group runs into hunks: runs at most 6 kept lines apart share one.
-  const hunks = [];
-  let group = [runs[0]];
-  for (let r = 1; r < runs.length; r++) {
-    const gap = runs[r].start - group[group.length - 1].end;
-    if (gap <= 6) group.push(runs[r]);
-    else {
-      hunks.push(group);
-      group = [runs[r]];
+  out.push(`makefun-diff/1 old=${nOld} new=${nNew} hunks=${spans.length} deleted=${deleted} inserted=${inserted}\n`);
+  let hIdx = 0;
+  let headerDone = false;
+  const pastHunk = (isOld, idx) => {
+    const h = hSpans[hIdx];
+    return h !== undefined && (isOld ? idx >= h.oEnd : idx >= h.nEnd);
+  };
+  const inHunk = (isOld, idx) => {
+    const h = hSpans[hIdx];
+    return h !== undefined && (isOld ? idx >= h.oStart && idx < h.oEnd : idx >= h.nStart && idx < h.nEnd);
+  };
+  const ensureHeader = () => {
+    if (!headerDone) {
+      const h = hSpans[hIdx];
+      out.push(`@ ${h.oStart + 1} ${h.oEnd - h.oStart} ${h.nStart + 1} ${h.nEnd - h.nStart}\n`);
+      headerDone = true;
     }
-  }
-  hunks.push(group);
-
-  out.push(
-    `makefun-diff/1 old=${nOld} new=${nNew} hunks=${hunks.length} deleted=${deleted} inserted=${inserted}\n`,
-  );
-
-  // Op index -> old/new line index maps, built once per render.
-  const oldAt = new Int32Array(total + 1);
-  const newAt = new Int32Array(total + 1);
-  let oi = 0;
-  let ni = 0;
-  for (let t = 0; t < total; t++) {
-    oldAt[t] = oi;
-    newAt[t] = ni;
-    if (ops[t] !== 2) oi++;
-    if (ops[t] !== 1) ni++;
-  }
-  oldAt[total] = oi;
-  newAt[total] = ni;
-
-  for (const g of hunks) {
-    const first = g[0];
-    const last = g[g.length - 1];
-    const hStart = Math.max(0, first.start - 3);
-    const hEnd = Math.min(total, last.end + 3);
-    const os = oldAt[hStart] + 1;
-    const ol = oldAt[hEnd] - oldAt[hStart];
-    const ns = newAt[hStart] + 1;
-    const nl = newAt[hEnd] - newAt[hStart];
-    out.push(`@ ${os} ${ol} ${ns} ${nl}\n`);
-    let t = hStart;
-    while (t < hEnd) {
-      if (ops[t] === 0) {
-        emitLine(out, '=', oldLines[oldAt[t]]);
-        t++;
-        continue;
+  };
+  for (const r of merged) {
+    if (r.t === KEEP) {
+      for (let t = 0; t < r.n; t++) {
+        const idx = r.oStart + t;
+        while (pastHunk(true, idx)) {
+          hIdx++;
+          headerDone = false;
+        }
+        if (inHunk(true, idx)) {
+          ensureHeader();
+          out.push('=', o.parts[idx], '\n');
+          if (o.bare && idx === nOld - 1) out.push('%\n');
+        }
       }
-      // A change run: all of its deletions, then all of its insertions.
-      let u = t;
-      while (u < hEnd && ops[u] !== 0) u++;
-      for (let v = t; v < u; v++) {
-        if (ops[v] === 1) emitLine(out, '-', oldLines[oldAt[v]]);
+    } else if (r.t === CHANGE) {
+      for (let t = 0; t < r.del; t++) {
+        const idx = r.oStart + t;
+        while (pastHunk(true, idx)) {
+          hIdx++;
+          headerDone = false;
+        }
+        if (inHunk(true, idx)) {
+          ensureHeader();
+          out.push('-', o.parts[idx], '\n');
+          if (o.bare && idx === nOld - 1) out.push('%\n');
+        }
       }
-      for (let v = t; v < u; v++) {
-        if (ops[v] === 2) emitLine(out, '+', newLines[newAt[v]]);
+      for (let t = 0; t < r.ins; t++) {
+        const idx = r.nStart + t;
+        while (pastHunk(false, idx)) {
+          hIdx++;
+          headerDone = false;
+        }
+        if (inHunk(false, idx)) {
+          ensureHeader();
+          out.push('+', w.parts[idx], '\n');
+          if (w.bare && idx === nNew - 1) out.push('%\n');
+        }
       }
-      t = u;
     }
   }
   return out.join('');
-}
-
-/** makefun-diff 1.0.0's answer for one case's input { old, new }. */
-export function run(input) {
-  const oldLines = splitLines(input.old);
-  const newLines = splitLines(input.new);
-  const ids = new Map();
-  const next = { value: 0 };
-  const a = toIds(oldLines, ids, next);
-  const b = toIds(newLines, ids, next);
-  const nA = a.length;
-  const nB = b.length;
-
-  let p = 0;
-  while (p < nA && p < nB && a[p] === b[p]) p++;
-  let sA = nA;
-  let sB = nB;
-  while (sA > p && sB > p && a[sA - 1] === b[sB - 1]) {
-    sA--;
-    sB--;
-  }
-  const N = sA - p;
-  const M = sB - p;
-
-  const { D, hist } = myers(a, p, N, b, p, M);
-  const { ops, oi } = backtrack(hist, D, a, p, N, b, p, M);
-
-  const full = new Uint8Array(nA + nB);
-  let fi = 0;
-  for (let t = 0; t < p; t++) full[fi++] = 0;
-  for (let t = oi; t < N + M; t++) full[fi++] = ops[t];
-  for (let t = 0; t < nA - sA; t++) full[fi++] = 0;
-  return render(oldLines, newLines, full, fi);
 }
